@@ -8,12 +8,14 @@ Original code and method by: Miron B Kursa, https://m2.icm.edu.pl/boruta/
 License: BSD 3 clause
 """
 
-from __future__ import print_function, division
+from __future__ import division, print_function
+
+import warnings
+
 import numpy as np
 import scipy as sp
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils import check_random_state, check_X_y
-from sklearn.base import TransformerMixin, BaseEstimator
-import warnings
 
 
 class BorutaPy(BaseEstimator, TransformerMixin):
@@ -179,8 +181,17 @@ class BorutaPy(BaseEstimator, TransformerMixin):
         Journal of Statistical Software, Vol. 36, Issue 11, Sep 2010
     """
 
-    def __init__(self, estimator, n_estimators=1000, perc=100, alpha=0.05,
-                 two_step=True, max_iter=100, random_state=None, verbose=0):
+    def __init__(
+        self,
+        estimator,
+        n_estimators=1000,
+        perc=100,
+        alpha=0.05,
+        two_step=True,
+        max_iter=100,
+        random_state=None,
+        verbose=0,
+    ):
         self.estimator = estimator
         self.n_estimators = n_estimators
         self.perc = perc
@@ -189,8 +200,33 @@ class BorutaPy(BaseEstimator, TransformerMixin):
         self.max_iter = max_iter
         self.random_state = random_state
         self.verbose = verbose
-        self.__version__ = '0.3'
-        self._is_lightgbm = 'lightgbm' in str(type(self.estimator))
+        self.__version__ = "0.3"
+        self._is_lightgbm = "lightgbm" in str(type(self.estimator))
+
+    @staticmethod
+    def _validate_pandas_input(arg):
+        try:
+            return arg.values
+        except AttributeError:
+            raise ValueError("input needs to be a numpy array or pandas data frame.")
+
+    @staticmethod
+    def _assign_hits(hit_reg, cur_imp, imp_sha_max):
+        # register hits for features that did better than the best of shadows
+        cur_imp_no_nan = cur_imp[0]
+        cur_imp_no_nan[np.isnan(cur_imp_no_nan)] = 0
+        hits = np.where(cur_imp_no_nan > imp_sha_max)[0]
+        hit_reg[hits] += 1
+        return hit_reg
+
+    @staticmethod
+    def _nanrankdata(X, axis=1):
+        """
+        Replaces bottleneck's nanrankdata with scipy and numpy alternative.
+        """
+        ranks = sp.stats.mstats.rankdata(X, axis=axis)
+        ranks[np.isnan(X)] = np.nan
+        return ranks
 
     def fit(self, X, y):
         """
@@ -261,26 +297,18 @@ class BorutaPy(BaseEstimator, TransformerMixin):
         self._fit(X, y)
         return self._transform(X, weak, return_df)
 
-    def _validate_pandas_input(self, arg):
-        try:
-            return arg.values
-        except AttributeError:
-            raise ValueError(
-                "input needs to be a numpy array or pandas data frame."
-            )
-
     def _fit(self, X, y):
         # check input params
         self._check_params(X, y)
 
         if not isinstance(X, np.ndarray):
-            X = self._validate_pandas_input(X) 
+            X = self._validate_pandas_input(X)
         if not isinstance(y, np.ndarray):
             y = self._validate_pandas_input(y)
 
         self.random_state = check_random_state(self.random_state)
         # setup variables for Boruta
-        n_sample, n_feat = X.shape
+        n_feat = X.shape[1]
         _iter = 1
         # holds the decision about each feature:
         # 0  - default state = tentative in original code
@@ -295,13 +323,13 @@ class BorutaPy(BaseEstimator, TransformerMixin):
         sha_max_history = []
 
         # set n_estimators
-        if self.n_estimators != 'auto':
+        if self.n_estimators != "auto":
             self.estimator.set_params(n_estimators=self.n_estimators)
 
         # main feature selection loop
         while np.any(dec_reg == 0) and _iter < self.max_iter:
             # find optimal number of trees and depth
-            if self.n_estimators == 'auto':
+            if self.n_estimators == "auto":
                 # number of features that aren't rejected
                 not_rejected = np.where(dec_reg >= 0)[0].shape[0]
                 n_tree = self._get_tree_num(not_rejected)
@@ -309,7 +337,9 @@ class BorutaPy(BaseEstimator, TransformerMixin):
 
             # make sure we start with a new tree in each iteration
             if self._is_lightgbm:
-                self.estimator.set_params(random_state=self.random_state.randint(0, 10000))
+                self.estimator.set_params(
+                    random_state=self.random_state.randint(0, 10000)
+                )
             else:
                 self.estimator.set_params(random_state=self.random_state)
 
@@ -342,8 +372,7 @@ class BorutaPy(BaseEstimator, TransformerMixin):
         # ignore the first row of zeros
         tentative_median = np.median(imp_history[1:, tentative], axis=0)
         # which tentative to keep
-        tentative_confirmed = np.where(tentative_median
-                                       > np.median(sha_max_history))[0]
+        tentative_confirmed = np.where(tentative_median > np.median(sha_max_history))[0]
         tentative = tentative[tentative_confirmed]
 
         # basic result variables
@@ -366,18 +395,18 @@ class BorutaPy(BaseEstimator, TransformerMixin):
 
         # update rank for not_selected features
         if not_selected.shape[0] > 0:
-                # calculate ranks in each iteration, then median of ranks across feats
-                iter_ranks = self._nanrankdata(imp_history_rejected, axis=1)
-                rank_medians = np.nanmedian(iter_ranks, axis=0)
-                ranks = self._nanrankdata(rank_medians, axis=0)
+            # calculate ranks in each iteration, then median of ranks across feats
+            iter_ranks = self._nanrankdata(imp_history_rejected, axis=1)
+            rank_medians = np.nanmedian(iter_ranks, axis=0)
+            ranks = self._nanrankdata(rank_medians, axis=0)
 
-                # set smallest rank to 3 if there are tentative feats
-                if tentative.shape[0] > 0:
-                    ranks = ranks - np.min(ranks) + 3
-                else:
-                    # and 2 otherwise
-                    ranks = ranks - np.min(ranks) + 2
-                self.ranking_[not_selected] = ranks
+            # set smallest rank to 3 if there are tentative feats
+            if tentative.shape[0] > 0:
+                ranks = ranks - np.min(ranks) + 3
+            else:
+                # and 2 otherwise
+                ranks = ranks - np.min(ranks) + 2
+            self.ranking_[not_selected] = ranks
         else:
             # all are selected, thus we set feature supports to True
             self.support_ = np.ones(n_feat, dtype=np.bool)
@@ -394,23 +423,17 @@ class BorutaPy(BaseEstimator, TransformerMixin):
         try:
             self.ranking_
         except AttributeError:
-            raise ValueError('You need to call the fit(X, y) method first.')
+            raise ValueError("You need to call the fit(X, y) method first.")
 
-        if weak:
-            indices = self.support_ + self.support_weak_
-        else:
-            indices = self.support_
+        indices = self.support_ + self.support_weak_ if weak else self.support_
+        X = X.iloc[:, indices] if return_df else X[:, indices]
 
-        if return_df:
-            X = X.iloc[:, indices]
-        else:
-            X = X[:, indices]
         return X
 
     def _get_tree_num(self, n_feat):
         depth = None
         try:
-            depth = self.estimator.get_params()['max_depth']
+            depth = self.estimator.get_params()["max_depth"]
         except KeyError:
             warnings.warn(
                 "The estimator does not have a max_depth property, as a result "
@@ -421,7 +444,7 @@ class BorutaPy(BaseEstimator, TransformerMixin):
         # how many times a feature should be considered on average
         f_repr = 100
         # n_feat * 2 because the training matrix is extended with n shadow features
-        multi = ((n_feat * 2) / (np.sqrt(n_feat * 2) * depth))
+        multi = (n_feat * 2) / (np.sqrt(n_feat * 2) * depth)
         n_estimators = int(multi * f_repr)
         return n_estimators
 
@@ -429,13 +452,17 @@ class BorutaPy(BaseEstimator, TransformerMixin):
         try:
             self.estimator.fit(X, y)
         except Exception as e:
-            raise ValueError('Please check your X and y variable. The provided '
-                             'estimator cannot be fitted to your data.\n' + str(e))
+            raise ValueError(
+                "Please check your X and y variable. The provided "
+                "estimator cannot be fitted to your data.\n" + str(e)
+            )
         try:
             imp = self.estimator.feature_importances_
         except Exception:
-            raise ValueError('Only methods with feature_importance_ attribute '
-                             'are currently supported in BorutaPy.')
+            raise ValueError(
+                "Only methods with feature_importance_ attribute "
+                "are currently supported in BorutaPy."
+            )
         return imp
 
     def _get_shuffle(self, seq):
@@ -450,7 +477,7 @@ class BorutaPy(BaseEstimator, TransformerMixin):
         # deep copy the matrix for the shadow matrix
         x_sha = np.copy(x_cur)
         # make sure there's at least 5 columns in the shadow matrix for
-        while (x_sha.shape[1] < 5):
+        while x_sha.shape[1] < 5:
             x_sha = np.hstack((x_sha, x_sha))
         # shuffle xSha
         x_sha = np.apply_along_axis(self._get_shuffle, 0, x_sha)
@@ -463,20 +490,12 @@ class BorutaPy(BaseEstimator, TransformerMixin):
         imp_real[x_cur_ind] = imp[:x_cur_w]
         return imp_real, imp_sha
 
-    def _assign_hits(self, hit_reg, cur_imp, imp_sha_max):
-        # register hits for features that did better than the best of shadows
-        cur_imp_no_nan = cur_imp[0]
-        cur_imp_no_nan[np.isnan(cur_imp_no_nan)] = 0
-        hits = np.where(cur_imp_no_nan > imp_sha_max)[0]
-        hit_reg[hits] += 1
-        return hit_reg
-
     def _do_tests(self, dec_reg, hit_reg, _iter):
         active_features = np.where(dec_reg >= 0)[0]
         hits = hit_reg[active_features]
         # get uncorrected p values based on hit_reg
-        to_accept_ps = sp.stats.binom.sf(hits - 1, _iter, .5).flatten()
-        to_reject_ps = sp.stats.binom.cdf(hits, _iter, .5).flatten()
+        to_accept_ps = sp.stats.binom.sf(hits - 1, _iter, 0.5).flatten()
+        to_reject_ps = sp.stats.binom.cdf(hits, _iter, 0.5).flatten()
 
         if self.two_step:
             # two step multicor process
@@ -547,14 +566,6 @@ class BorutaPy(BaseEstimator, TransformerMixin):
         reject_[pvals_sortind] = reject
         return reject_, pvals_corrected_
 
-    def _nanrankdata(self, X, axis=1):
-        """
-        Replaces bottleneck's nanrankdata with scipy and numpy alternative.
-        """
-        ranks = sp.stats.mstats.rankdata(X, axis=axis)
-        ranks[np.isnan(X)] = np.nan
-        return ranks
-
     def _check_params(self, X, y):
         """
         Check hyperparameters as well as X and y before proceeding with fit.
@@ -562,16 +573,17 @@ class BorutaPy(BaseEstimator, TransformerMixin):
         # check X and y are consistent len, X is Array and y is column
         X, y = check_X_y(X, y)
         if self.perc <= 0 or self.perc > 100:
-            raise ValueError('The percentile should be between 0 and 100.')
+            raise ValueError("The percentile should be between 0 and 100.")
 
         if self.alpha <= 0 or self.alpha > 1:
-            raise ValueError('Alpha should be between 0 and 1.')
+            raise ValueError("Alpha should be between 0 and 1.")
 
     def _print_results(self, dec_reg, _iter, flag):
-        n_iter = str(_iter) + ' / ' + str(self.max_iter)
+        n_iter = str(_iter) + " / " + str(self.max_iter)
         n_confirmed = np.where(dec_reg == 1)[0].shape[0]
         n_rejected = np.where(dec_reg == -1)[0].shape[0]
-        cols = ['Iteration: ', 'Confirmed: ', 'Tentative: ', 'Rejected: ']
+        cols = ["Iteration: ", "Confirmed: ", "Tentative: ", "Rejected: "]
+        output = None
 
         # still in feature selection
         if flag == 0:
@@ -580,13 +592,13 @@ class BorutaPy(BaseEstimator, TransformerMixin):
             if self.verbose == 1:
                 output = cols[0] + n_iter
             elif self.verbose > 1:
-                output = '\n'.join([x[0] + '\t' + x[1] for x in zip(cols, content)])
+                output = "\n".join([x[0] + "\t" + x[1] for x in zip(cols, content)])
 
         # Boruta finished running and tentatives have been filtered
         else:
             n_tentative = np.sum(self.support_weak_)
-            n_rejected = np.sum(~(self.support_|self.support_weak_))
+            n_rejected = np.sum(~(self.support_ | self.support_weak_))
             content = map(str, [n_iter, n_confirmed, n_tentative, n_rejected])
-            result = '\n'.join([x[0] + '\t' + x[1] for x in zip(cols, content)])
+            result = "\n".join([x[0] + "\t" + x[1] for x in zip(cols, content)])
             output = "\n\nBorutaPy finished running.\n\n" + result
         print(output)
